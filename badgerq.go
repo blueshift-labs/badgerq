@@ -2,6 +2,7 @@ package badgerq
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"runtime"
@@ -16,6 +17,8 @@ import (
 const GCDiscardRatio = 0.5
 
 var GCInterval = 1 * time.Minute
+
+var errIterationEOF = errors.New("reached end of iteration")
 
 // logging stuff copied from github.com/blueshift-labs/nsq/internal/lg
 
@@ -217,27 +220,35 @@ func (q *badgerq) readLoop() {
 func (q *badgerq) scanLoop() {
 	defer close(q.scanStopped)
 
+	var err error
 	for {
+		dur := q.idleWait
+		if err != nil && err == errIterationEOF {
+			dur = 0
+		}
+
 		select {
 		case <-q.stop:
 			return
-		case <-time.After(q.idleWait):
-			q.db.Update(func(txn *badger.Txn) error {
+		case <-time.After(dur):
+			bufferedKeys := make([][]byte, 0, int(q.bufferSize))
+
+			err = q.db.View(func(txn *badger.Txn) error {
 				opts := badger.DefaultIteratorOptions
 				opts.PrefetchSize = int(q.bufferSize)
 				it := txn.NewIterator(opts)
 				defer it.Close()
 
-				for it.Rewind(); it.Valid(); it.Next() {
+				for it.Rewind(); it.Valid() && int64(len(bufferedKeys)) < q.bufferSize; it.Next() {
 					item := it.Item()
 					key := item.KeyCopy(nil)
 					if q.cutOffFunc(key) {
 						break
 					}
 
-					if data, err := item.ValueCopy(nil); err != nil {
-						q.logger(ERROR, "BADGERQ(%s) error reading data - %s", q.name, err)
-						break
+					if data, _err := item.ValueCopy(nil); _err != nil {
+						q.logger(ERROR, "BADGERQ(%s) error reading data - %s", q.name, _err)
+						return _err
 					} else {
 						select {
 						case <-q.stop:
@@ -245,16 +256,26 @@ func (q *badgerq) scanLoop() {
 						case <-time.After(q.idleWait):
 							return nil
 						case q.buffer <- data:
-							if err := txn.Delete(key); err != nil {
-								q.logger(ERROR, "BADGERQ(%s) failed to delete buffered data - %s", q.name, err)
-								return nil
-							}
+							bufferedKeys = append(bufferedKeys, key)
 						}
 					}
 				}
 
-				return nil
+				return errIterationEOF
 			})
+
+			if len(bufferedKeys) > 0 {
+				wb := q.db.NewWriteBatch()
+				for _, key := range bufferedKeys {
+					if _err := wb.Delete(key); _err != nil {
+						q.logger(ERROR, "BADGERQ(%s) failed to delete buffered data - %s", q.name, _err)
+					}
+				}
+				if _err := wb.Flush(); _err != nil {
+					q.logger(ERROR, "BADGERQ(%s) failed to flush deletes of buffered data - %s", q.name, _err)
+				}
+				wb.Cancel()
+			}
 		}
 	}
 }

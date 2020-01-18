@@ -140,6 +140,40 @@ type testInterface interface {
 	Errorf(format string, args ...interface{})
 }
 
+func fastWrite(t testInterface, q *badgerq, workers, msgSize, messages int, ts time.Time) <-chan struct{} {
+	ch := make(chan []byte, messages)
+	go func() {
+		defer close(ch)
+		for i := 0; i < messages; i++ {
+			ch <- NewMessageData(t, uuid.NewV4(), NewDataBlob(msgSize), ts)
+		}
+
+		q.logger(INFO, "finishing sending %d messages to write", messages)
+	}()
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		var wg sync.WaitGroup
+		wg.Add(workers)
+		for i := 0; i < workers; i++ {
+			go func() {
+				defer wg.Done()
+				for msg := range ch {
+					if err := q.Put(msg); err != nil {
+						t.Errorf("error putting data to badgerq: %s", err)
+					}
+				}
+			}()
+		}
+		wg.Wait()
+	}()
+
+	return done
+}
+
 func testBadgerQ(t testInterface,
 	bufSize int64, msgSize, totalCurWrites, totalFutureWrites, moreFutureMessages, totalCurReads int,
 	idleWait, syncInterval time.Duration,
@@ -156,46 +190,18 @@ func testBadgerQ(t testInterface,
 		t.Fatalf("badgerq depth should be 0")
 	}
 
-	curWritesDone := make(chan struct{})
-	futureWritesDone := make(chan struct{})
-	curReadsDone := make(chan struct{})
-	futureTime := time.Now().Add(30 * time.Second)
+	writeWorkers := 1000
 
 	logger(INFO, "start writing future messages")
-	go func() {
-		var futureWriteWg sync.WaitGroup
-		futureWriteWg.Add(totalFutureWrites)
-		for i := 0; i < totalFutureWrites; i++ {
-			go func() {
-				defer futureWriteWg.Done()
-				msg := NewMessageData(t, uuid.NewV4(), NewDataBlob(msgSize), futureTime)
-				if err := q.Put(msg); err != nil {
-					t.Errorf("error putting data to badgerq: %s", err)
-				}
-			}()
-		}
-		futureWriteWg.Wait()
-		close(futureWritesDone)
-	}()
+	futureTime := time.Now().Add(24 * time.Hour)
+	futureWritesDone := fastWrite(t, q, writeWorkers, msgSize, totalFutureWrites, futureTime)
 
 	logger(INFO, "start writing current messages")
-	go func() {
-		var curWriteWg sync.WaitGroup
-		curWriteWg.Add(totalCurWrites)
-		for i := 0; i < totalCurWrites; i++ {
-			go func() {
-				defer curWriteWg.Done()
-				msg := NewMessageData(t, uuid.NewV4(), NewDataBlob(msgSize), time.Now())
-				if err := q.Put(msg); err != nil {
-					t.Errorf("error putting data to badgerq: %s", err)
-				}
-			}()
-		}
-		curWriteWg.Wait()
-		close(curWritesDone)
-	}()
+	curTime := time.Now()
+	curWritesDone := fastWrite(t, q, writeWorkers, msgSize, totalCurWrites, curTime)
 
 	// all cur reads should be before future timestamp
+	curReadsDone := make(chan struct{})
 	logger(INFO, "start reading current messages")
 	go func() {
 		msgs := map[string]bool{}
@@ -213,7 +219,7 @@ func testBadgerQ(t testInterface,
 			var msgID [16]byte
 			copy(msgID[:], key[8:])
 			if msgs[uuid.UUID(msgID).String()] {
-				t.Errorf("duplicated messages received")
+				t.Errorf("duplicated messages received: %s", uuid.UUID(msgID).String())
 			} else {
 				msgs[uuid.UUID(msgID).String()] = true
 			}
@@ -232,7 +238,7 @@ func testBadgerQ(t testInterface,
 	// wait for read loop to decrease the counter for consumed messages
 	<-time.After(time.Second)
 
-	// there should be 100 future writes on disk, 180 cur reads finished, 10 cur reads in buffer and 10 cur reads on disk
+	// there should be future writes on disk, cur reads finished, cur reads in buffer and cur reads on disk
 	expectedDepth := int64(totalFutureWrites + totalCurWrites - totalCurReads)
 	curDepth := q.Depth()
 	if curDepth != expectedDepth {
@@ -268,7 +274,7 @@ func testBadgerQ(t testInterface,
 		var msgID [16]byte
 		copy(msgID[:], key[8:])
 		if msgs[uuid.UUID(msgID).String()] {
-			t.Errorf("duplicated messages received")
+			t.Errorf("duplicated messages received: %s", uuid.UUID(msgID).String())
 		} else {
 			msgs[uuid.UUID(msgID).String()] = true
 		}
@@ -318,7 +324,7 @@ func testBadgerQ(t testInterface,
 	}
 
 	// should halt at reading future message
-	logger(INFO, "halt at reading future messages")
+	logger(INFO, "halt at reading more future messages")
 	select {
 	case <-time.After(2 * idleWait):
 	case <-q.ReadChan():
@@ -343,7 +349,7 @@ func testBadgerQ(t testInterface,
 	}
 }
 
-func TestBadgerQ(t *testing.T) {
+func TestBattleBadgerQ(t *testing.T) {
 	for n := 0; n < 50; n++ {
 		bufSize := rand.Int63n(1000)
 		msgSize := rand.Intn(200000) + 400000     // 0.4MB - 0.6MB
@@ -356,6 +362,14 @@ func TestBadgerQ(t *testing.T) {
 
 		testBadgerQ(t, bufSize, msgSize, totalCurWrites, totalFutureWrites, moreFutureMessages, totalCurReads, idleWait, syncInterval, TestLogger)
 	}
+}
+
+func TestNormalBadgerQ(t *testing.T) {
+	testBadgerQ(t, 10000, 5000, 1000000, 0, 0, 92400, time.Millisecond, time.Second, TestLogger)
+}
+
+func TestHugeBadgerQ(t *testing.T) {
+	testBadgerQ(t, 1000, 500000, 10000, 0, 0, 9019, time.Millisecond, time.Second, TestLogger)
 }
 
 func benchmarkBadgerQPut(b *testing.B, msgSize int) {
