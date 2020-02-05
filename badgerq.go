@@ -222,9 +222,9 @@ func (q *badgerq) scanLoop() {
 
 	var err error
 	for {
-		dur := q.idleWait
+		dur := q.idleWait //defaults 250ms
 		if err != nil && err == errIterationEOF {
-			dur = 0
+			dur = time.Millisecond * 100
 		}
 
 		select {
